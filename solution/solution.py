@@ -149,6 +149,66 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
 
+def _mean(values: list[float]) -> float:
+    """Arithmetic mean; 0.0 for an empty list."""
+    return sum(values) / len(values) if values else 0.0
+
+
+def _mean_optional(values: list[float | None]) -> float | None:
+    """Mean of the non-None values; None when no value is present."""
+    present = [v for v in values if v is not None]
+    return sum(present) / len(present) if present else None
+
+
+def _md_cell(text: str) -> str:
+    """Make text safe for a single Markdown table cell."""
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+ANSWER_METRICS: tuple[str, ...] = ("faithfulness", "relevance", "completeness")
+
+# A metric average dropping by more than this vs baseline blocks deploy.
+REGRESSION_TOLERANCE = 0.05
+
+ROOT_CAUSES: dict[str, str] = {
+    "faithfulness": "Context is missing or irrelevant — improve retrieval",
+    "relevance": "Answer does not address the question — improve prompt clarity",
+    "completeness": (
+        "Answer is missing key information — increase context window or improve generation"
+    ),
+    "multiple": "Multiple issues detected — review full pipeline",
+}
+
+FIX_BY_FAILURE_TYPE: dict[str, str] = {
+    "hallucination": (
+        "Add a grounding guardrail: instruct the generator to answer only from retrieved "
+        "chunks and refuse when evidence is missing, then filter unsupported claims"
+    ),
+    "irrelevant": (
+        "Rewrite the system prompt to restate the user's question and answer it directly; "
+        "add query rewriting before retrieval"
+    ),
+    "incomplete": (
+        "Raise top-k / chunk size so all policy conditions are retrieved, and add few-shot "
+        "examples of complete multi-condition answers"
+    ),
+    "off_topic": (
+        "Add intent/scope detection so out-of-scope or adversarial questions get a "
+        "polite refusal instead of an unrelated answer"
+    ),
+    "refusal": (
+        "Relax over-strict guardrails and add in-scope examples so answerable "
+        "questions are not refused"
+    ),
+}
+
+GENERAL_FIXES: tuple[str, ...] = (
+    "Add a reranking step so the most relevant chunks are placed first in the context",
+    "Add failing cases to the golden dataset and run the benchmark as a CI regression gate",
+    "Calibrate the LLM judge against a small human-labelled sample to confirm the failures",
+)
+
+
 class RAGASEvaluator:
     """
     Evaluates RAG pipeline outputs using RAGAS-inspired heuristics.
@@ -551,10 +611,21 @@ class BenchmarkRunner:
         Returns:
             List of EvalResult, one per qa_pair.
         """
-        # TODO: for each pair, call agent_fn(pair.question), then run_full_eval.
-        # Pass pair.retrieved_contexts as the optional contexts argument and
-        # preserve the original pair on the returned EvalResult.
-        raise NotImplementedError("Implement BenchmarkRunner.run")
+        results: list[EvalResult] = []
+        for pair in qa_pairs:
+            answer = agent_fn(pair.question)
+            result = evaluator.run_full_eval(
+                answer=answer,
+                question=pair.question,
+                context=pair.context,
+                expected=pair.expected_answer,
+                # No retrieved chunks → leave retrieval metrics as None, not 0.0.
+                contexts=pair.retrieved_contexts or None,
+            )
+            # Keep the original pair so metadata (id, difficulty) survives.
+            result.qa_pair = pair
+            results.append(result)
+        return results
 
     def generate_report(self, results: list[EvalResult]) -> dict[str, Any]:
         """
@@ -576,8 +647,25 @@ class BenchmarkRunner:
         Average only non-None retrieval scores. Return None for a retrieval
         average when no result contains that metric.
         """
-        # TODO
-        raise NotImplementedError("Implement generate_report")
+        total = len(results)
+        passed = sum(1 for r in results if r.passed)
+
+        failure_types: dict[str, int] = {}
+        for r in results:
+            if not r.passed and r.failure_type:
+                failure_types[r.failure_type] = failure_types.get(r.failure_type, 0) + 1
+
+        return {
+            "total": total,
+            "passed": passed,
+            "pass_rate": passed / total if total else 0.0,
+            "avg_faithfulness": _mean([r.faithfulness for r in results]),
+            "avg_relevance": _mean([r.relevance for r in results]),
+            "avg_completeness": _mean([r.completeness for r in results]),
+            "avg_context_recall": _mean_optional([r.context_recall for r in results]),
+            "avg_context_precision": _mean_optional([r.context_precision for r in results]),
+            "failure_types": failure_types,
+        }
 
     def run_regression(self, new_results: list, baseline_results: list) -> dict:
         """Compare new evaluation results against a baseline.
@@ -599,9 +687,23 @@ class BenchmarkRunner:
               - 'regressions': list[str] — names of metrics that regressed
               - 'passed': bool — True if no regressions
 
-        TODO: Compute avg per metric, compare, list regressions, set passed flag
+        A drop of exactly REGRESSION_TOLERANCE is tolerated; only a larger
+        drop counts. Improvements never count as regressions.
         """
-        raise NotImplementedError
+        report: dict[str, Any] = {}
+        regressions: list[str] = []
+        for metric in ANSWER_METRICS:
+            new_avg = _mean([getattr(r, metric) for r in new_results])
+            baseline_avg = _mean([getattr(r, metric) for r in baseline_results])
+            report[f"new_avg_{metric}"] = new_avg
+            report[f"baseline_avg_{metric}"] = baseline_avg
+            # Small epsilon so float noise at exactly 0.05 is not flagged.
+            if baseline_avg - new_avg > REGRESSION_TOLERANCE + 1e-9:
+                regressions.append(metric)
+
+        report["regressions"] = regressions
+        report["passed"] = not regressions
+        return report
 
     def identify_failures(
         self,
@@ -618,8 +720,10 @@ class BenchmarkRunner:
         Returns:
             List of failing EvalResults.
         """
-        # TODO
-        raise NotImplementedError("Implement identify_failures")
+        return [
+            r for r in results
+            if min(r.faithfulness, r.relevance, r.completeness) < threshold
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -653,8 +757,11 @@ class FailureAnalyzer:
             dict mapping failure_type → count.
             Example: {"hallucination": 3, "irrelevant": 2, "incomplete": 5}
         """
-        # TODO
-        raise NotImplementedError("Implement categorize_failures")
+        counts: dict[str, int] = {}
+        for failure in failures:
+            failure_type = failure.failure_type or "unknown"
+            counts[failure_type] = counts.get(failure_type, 0) + 1
+        return counts
 
     def find_root_cause(self, failure: EvalResult) -> str:
         """
@@ -666,8 +773,18 @@ class FailureAnalyzer:
             "Answer is missing key information — increase context window or improve generation"
             "Multiple issues detected — review full pipeline"
         """
-        # TODO: compare faithfulness, relevance, completeness, return appropriate string
-        raise NotImplementedError("Implement find_root_cause")
+        scores = {
+            "faithfulness": failure.faithfulness,
+            "relevance": failure.relevance,
+            "completeness": failure.completeness,
+        }
+        lowest = min(scores.values())
+        lowest_metrics = [name for name, value in scores.items() if value == lowest]
+
+        # No single weakest step (tie) or everything collapsed → whole pipeline.
+        if len(lowest_metrics) > 1 or all(v < 0.3 for v in scores.values()):
+            return ROOT_CAUSES["multiple"]
+        return ROOT_CAUSES[lowest_metrics[0]]
 
     def generate_improvement_log(self, failures: list, suggestions: list[str]) -> str:
         """Generate a Markdown table logging failures and improvement actions.
@@ -684,9 +801,32 @@ class FailureAnalyzer:
         Returns:
             Markdown table string with a row per failure. Status is always "Open".
 
-        TODO: Build markdown table with failure details + matched suggestions
+        Fix selection per row: the suggestion targeting this failure type if it
+        is in ``suggestions``; otherwise ``suggestions[index]``; otherwise the
+        default fix for the type.
         """
-        raise NotImplementedError
+        lines = [
+            "| Failure ID | Type | Root Cause | Suggested Fix | Status |",
+            "|------------|------|------------|---------------|--------|",
+        ]
+        for index, failure in enumerate(failures):
+            failure_type = failure.failure_type or "unknown"
+            type_fix = FIX_BY_FAILURE_TYPE.get(failure_type.lower())
+            if type_fix is not None and type_fix in suggestions:
+                fix = type_fix
+            elif index < len(suggestions):
+                fix = suggestions[index]
+            else:
+                fix = type_fix or GENERAL_FIXES[0]
+            cells = [
+                f"F{index + 1:03d}",
+                failure_type,
+                self.find_root_cause(failure),
+                fix,
+                "Open",
+            ]
+            lines.append("| " + " | ".join(_md_cell(c) for c in cells) + " |")
+        return "\n".join(lines)
 
     def generate_improvement_suggestions(
         self, failures: list[EvalResult]
@@ -704,8 +844,26 @@ class FailureAnalyzer:
         Returns:
             List of at least 3 suggestion strings (or fewer if failures is empty).
         """
-        # TODO: analyze categorized failures and return suggestions
-        raise NotImplementedError("Implement generate_improvement_suggestions")
+        if not failures:
+            return []
+
+        # Failure clustering: fix the most frequent failure type first.
+        counts = self.categorize_failures(failures)
+        ordered_types = sorted(counts, key=lambda t: (-counts[t], t))
+
+        suggestions: list[str] = []
+        for failure_type in ordered_types:
+            fix = FIX_BY_FAILURE_TYPE.get(failure_type.lower())
+            if fix and fix not in suggestions:
+                suggestions.append(fix)
+
+        # Top up with pipeline-wide actions so there are always >= 3.
+        for fix in GENERAL_FIXES:
+            if len(suggestions) >= 3:
+                break
+            if fix not in suggestions:
+                suggestions.append(fix)
+        return suggestions
 
 
 # ---------------------------------------------------------------------------
