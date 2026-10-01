@@ -297,19 +297,54 @@ verbosity bias và self-preference bằng cách nào?
 Chỉ làm sau khi hoàn thành 3.1–3.3. Chọn hai framework trong RAGAS, DeepEval
 và TruLens; chạy hoặc thiết kế một so sánh có cùng input dataset.
 
-| Tiêu chí | Framework 1: ____ | Framework 2: ____ |
+> **Phạm vi:** đây là **bản thiết kế so sánh**, kèm script chạy được (`bonus/framework_comparison.py`, phụ thuộc trong `bonus/requirements-bonus.txt`). Tôi đã chạy thử thành công trên 2 case (E01, E02). Lần chạy đủ 20 case bị dừng do tài khoản API hết credit (lỗi HTTP 402 từ OpenRouter). Kết quả thiếu điểm đó đã bị loại bỏ, không dùng để kết luận. Mọi con số dưới đây chỉ lấy từ lần chạy thử 2 case.
+
+**Thiết kế thí nghiệm**
+
+- **Input giống hệt nhau cho cả hai framework và heuristic của lab:** 20 traces trong `artifacts/actual_answers.json` (question, actual answer, 5 retrieved chunks) và `expected_answer` trong `golden_dataset.json`. Không sinh lại answer, nên khác biệt điểm chỉ đến từ evaluator.
+- **Cùng judge model:** `gpt-4o-mini`, `temperature = 0`, `max_tokens = 1024`, qua cùng endpoint OpenAI-compatible. RAGAS dùng thêm `text-embedding-3-small` cho Response Relevancy.
+- **Ghép metric tương ứng:**
+
+| Khía cạnh | Heuristic của lab | RAGAS 0.4.3 | DeepEval 4.2.7 |
+|---|---|---|---|
+| Grounding | `evaluate_faithfulness` (token overlap) | `Faithfulness` (tách claims rồi kiểm tra với context bằng LLM) | `FaithfulnessMetric` (trích claims và truths, LLM ra verdict) |
+| Relevance | `evaluate_relevance` | `ResponseRelevancy` (LLM sinh lại câu hỏi từ answer, so cosine embedding) | `AnswerRelevancyMetric` (tách statements, LLM phán từng statement có liên quan không) |
+| Retrieval coverage | `evaluate_context_recall` | `LLMContextRecall` (claims trong reference có được context hỗ trợ không) | `ContextualRecallMetric` |
+| Retrieval ranking | `evaluate_context_precision` (AP@K) | `LLMContextPrecisionWithReference` (AP theo verdict của LLM) | `ContextualPrecisionMetric` (weighted precision theo rank) |
+
+- **Đo lường:** điểm trung bình mỗi metric; Pearson r giữa RAGAS và DeepEval và giữa mỗi framework với heuristic; số case fail (score < 0.5) và giao của tập fail giữa các evaluator; thời gian chạy. Script trả mã lỗi nếu còn ô thiếu điểm, để không so sánh trên dữ liệu không đầy đủ.
+- **Kiểm soát nhiễu:** chạy 3 lần, báo trung bình ± độ lệch chuẩn (LLM judge không hoàn toàn deterministic); đọc tay các case mà hai framework lệch nhau > 0.3.
+
+**Kết quả chạy thử (2 case, cùng judge `gpt-4o-mini`)**
+
+| Case | Evaluator | Faithfulness | Relevance | Ctx Recall | Ctx Precision |
+|---|---|---:|---:|---:|---:|
+| E01 | Lab heuristic | 0.810 | 0.500 | 1.000 | 0.867 |
+| E01 | RAGAS | 0.667 | 0.856 | 1.000 | 1.000 |
+| E01 | DeepEval | 0.500 | 1.000 | 1.000 | 1.000 |
+| E02 | Lab heuristic | 0.667 | 0.333 | 0.833 | 0.950 |
+| E02 | RAGAS | 1.000 | 0.962 | 1.000 | 1.000 |
+| E02 | DeepEval | 1.000 | 1.000 | 1.000 | 1.000 |
+
+Thời gian chạy thử: RAGAS ≈ 17 s, DeepEval ≈ 34 s cho 2 case. RAGAS chạy song song (`max_workers = 4`), còn DeepEval chạy tuần tự với `async_mode = False`.
+
+| Tiêu chí | Framework 1: RAGAS | Framework 2: DeepEval |
 |---|---|---|
-| Setup complexity | | |
-| Metrics available | | |
-| CI/CD integration | | |
-| Kết quả trên cùng dataset | | |
-| Insight rút ra | | |
+| Setup complexity | Trung bình đến cao. Phụ thuộc hệ sinh thái LangChain: với ragas 0.4.3, `langchain-community` 0.4.x làm vỡ import (`chat_models.vertexai` đã bị gỡ), phải pin `<0.4`. Cần cả LLM lẫn **embedding model** (cho Response Relevancy). Dữ liệu đưa vào qua `EvaluationDataset.from_list` với các field `user_input`/`response`/`retrieved_contexts`/`reference`. | Trung bình. Cài một gói, không phụ thuộc LangChain. Muốn dùng endpoint không phải OpenAI thì phải viết lớp con `DeepEvalBaseLLM` (`generate`/`a_generate` trả về pydantic schema). Mặc định không giới hạn `max_tokens`, nên với tài khoản ít credit mỗi request bị giữ trước khoảng 16k token. Đây chính là nguyên nhân khiến lần chạy đủ thất bại. |
+| Metrics available | Faithfulness, Response Relevancy, Context Recall/Precision (LLM hoặc non-LLM), Context Entities Recall, Noise Sensitivity, Factual Correctness, Semantic Similarity, cùng các metric agent/tool-call. Thiên về chỉ số RAG có cơ sở nghiên cứu. | Faithfulness, Answer Relevancy, Contextual Recall/Precision/Relevancy, Hallucination, Bias, Toxicity, G-Eval (rubric tự định nghĩa), DAG metric, cùng các metric agent và conversation. Rộng hơn về safety và rubric tuỳ biến. |
+| CI/CD integration | Không có test runner riêng: gọi `evaluate()` trong script hoặc pytest rồi tự assert ngưỡng trên DataFrame kết quả. Phù hợp với `run_regression()` của lab (so trung bình với baseline). | Tích hợp sẵn kiểu unit test: `assert_test(test_case, [metrics])` và `deepeval test run`, mỗi metric có `threshold` và trả pass/fail cho từng case. Dễ đưa vào CI làm quality gate. |
+| Kết quả trên cùng dataset | Chạy thử 2 case: Faithfulness 0.667 và 1.000, Relevance 0.856 và 0.962. Chạy đủ 20 case chưa hoàn tất (hết credit). | Chạy thử 2 case: Faithfulness 0.500 và 1.000, Relevance 1.000 và 1.000. Chạy đủ 20 case chưa hoàn tất (hết credit). |
+| Insight rút ra | Relevance dựa trên embedding cho điểm liên tục (0.86, 0.96), phân biệt được mức độ. Ở E01, gắn cờ một claim diễn đạt mạnh hơn corpus ("needs … to charge properly"). | Relevance theo từng statement nên dễ bão hoà ở 1.000 với câu ngắn. Gắn cờ cùng claim đó ở E01, nhưng vì tách answer thành ít claims hơn nên điểm Faithfulness thấp hơn (0.500 so với 0.667). Cả hai framework đều xác nhận E02 trả lời đúng, trong khi heuristic của lab đánh trượt E02 (`off_topic`, Relevance 0.333). |
 
 - Scores có nhất quán không?
 - Framework nào strict hơn và vì sao?
 - Hai framework có tìm ra cùng failure cases không?
 
 > *Phân tích:*
+> - **Mức nhất quán:** trên 2 case chạy thử, RAGAS và DeepEval **cùng hướng**: cùng thấy E01 có claim ngoài context (Faithfulness < 1) và E02 hoàn toàn grounded. Cả hai **ngược hướng với heuristic** ở Relevance: heuristic chấm E02 0.333 (fail), trong khi RAGAS 0.962 và DeepEval 1.000. Điều này khớp với nhận định ở 3.2 rằng token overlap phạt câu trả lời ngắn mà đúng. Với 2 điểm dữ liệu thì chưa thể tính tương quan có ý nghĩa. Thí nghiệm đầy đủ sẽ báo Pearson r cho mỗi metric. Giả thuyết: r(RAGAS, DeepEval) cao với Faithfulness và Recall vì cùng cơ chế claim-verification, thấp hơn với Relevance vì hai cơ chế khác nhau (embedding và statement verdict).
+> - **Strict hơn:** ở Faithfulness, DeepEval cho E01 điểm thấp hơn (0.500 so với 0.667), nhưng xét theo số học thì **cả hai đều đánh một claim là không được hỗ trợ** (script không lưu reason nên đây là suy luận từ trace; ứng viên rõ nhất là): answer "The NovaBook 14 needs a 65 W USB-C Power Delivery adapter to charge properly…" diễn đạt mạnh hơn corpus ("It charges through either USB-C port with a 65 W USB-C Power Delivery adapter"). Chênh lệch đến từ **độ chi tiết khi tách claim**: DeepEval tách thành 2 claims (1/2 = 0.500), RAGAS thành 3 (2/3 = 0.667). Vì vậy DeepEval *nhạy hơn* với câu trả lời ngắn, chứ không hẳn có tiêu chuẩn khắt khe hơn. Cũng nên lưu ý cờ này hơi khắt khe: corpus có nói adapter công suất thấp sạc chậm, nên "needs … to charge properly" gần như được ngụ ý. Ở Relevance, **RAGAS strict hơn**: ResponseRelevancy sinh lại câu hỏi từ answer và đo cosine, nên hiếm khi đạt 1.0; DeepEval chỉ hỏi "statement có liên quan không" nên dễ bão hoà ở 1.0. Kết luận này chỉ dựa trên 2 case và cần xác nhận bằng lần chạy đầy đủ.
+> - **Cùng failure cases?** Chưa xác nhận được trên 20 case. Dựa trên cơ chế, dự đoán: cả hai sẽ **cùng bắt** H01 (answer nói 45 ngày trong khi context nói 21 ngày, mâu thuẫn trực tiếp với claim, điều heuristic bỏ sót) và H05 (claim loaner sai). Cả hai sẽ **cùng bỏ qua** E02/E03 (đúng), tức loại được các failure giả của heuristic. Hai framework có thể **khác nhau** ở A01/A02 (câu từ chối): DeepEval Faithfulness thường cho 1.0 khi answer không có claim sự kiện nào, còn RAGAS Response Relevancy cho câu từ chối điểm rất thấp (có thể 0) vì nó coi answer "noncommittal". Cả hai đều không đo trực tiếp hành vi an toàn, nên với adversarial vẫn cần behavior checks hoặc rubric (G-Eval của DeepEval là lựa chọn phù hợp).
+> - **Lựa chọn cho OrbitTech:** dùng **DeepEval** làm quality gate trong CI (`assert_test`, ngưỡng theo từng case, G-Eval để cài rubric 3.3), và **RAGAS** cho phân tích retrieval định kỳ (bộ context metrics phong phú hơn). Bài học vận hành từ lần chạy này: luôn đặt `max_tokens`, theo dõi chi phí, và để pipeline **fail** khi thiếu điểm thay vì tính trung bình trên dữ liệu thiếu.
 
 ### Exercise 3.5 — Retrieval Reranking (Bonus +5)
 
@@ -361,6 +396,6 @@ Hoàn thành kiểm tra cuối trong khoảng 11:50–12:00.
 - [x] Exercise 3.1 hoàn thành trong file JSON và bảng kết quả phía trên.
 - [x] Exercise 3.2 có năm metrics, aggregate report và ba cases thấp nhất.
 - [x] Exercise 3.3 có rubric 1–5 và bias controls.
-- [ ] `reflection.md` có ba failure analyses và regression strategy.
+- [x] `reflection.md` có ba failure analyses và regression strategy.
 - [x] Đã copy `template.py` thành `solution/solution.py`.
-- [ ] Exercise 3.4 và 3.5 chỉ làm nếu chọn bonus.
+- [x] Exercise 3.4 và 3.5 chỉ làm nếu chọn bonus. (3.5 chạy đầy đủ; 3.4 dạng thiết kế + chạy thử 2 case)
